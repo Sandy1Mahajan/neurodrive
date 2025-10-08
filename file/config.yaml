@@ -1,0 +1,142 @@
+# NeuroDrive Production Configuration
+system:
+  app_name: "NeuroDrive Advanced Monitoring System"
+  version: "1.0.0"
+  log_level: "INFO"
+  max_threads: 8
+  frame_rate: 30
+  
+# Camera Configuration
+cameras:
+  driver_cam:
+    index: 0
+    resolution: [1280, 720]
+    fps: 30
+  cabin_cam:
+    index: 1
+    resolution: [1280, 720] 
+    fps: 30
+  ir_cam:
+    index: 2
+    resolution: [640, 480]
+    fps: 30
+  external_cam:
+    index: 3
+    resolution: [1920, 1080]
+    fps: 30
+
+# Audio Configuration
+audio:
+  device_index: 0
+  sample_rate: 16000
+  chunk_size: 1024
+  channels: 1
+  noise_threshold: 0.7
+  distraction_threshold: 0.8
+
+# Model Paths and Settings
+models:
+  face_detection:
+    model: "mediapipe"
+    min_detection_confidence: 0.7
+    min_tracking_confidence: 0.5
+  
+  face_recognition:
+    model: "arcface"
+    threshold: 0.6
+    
+  eye_tracking:
+    ear_threshold: 0.2
+    consecutive_frames: 20
+    yawn_threshold: 30
+    
+  head_pose:
+    pitch_threshold: 30
+    yaw_threshold: 45
+    roll_threshold: 25
+    
+  gesture_detection:
+    model: "mediapipe_hands"
+    confidence: 0.7
+    max_hands: 2
+    
+  object_detection:
+    model: "yolov8n.pt"
+    confidence: 0.6
+    classes: [32, 67]  # phone, cigarette
+    
+  low_light:
+    model: "retinaface"
+    enhancement: true
+    
+  weather:
+    model: "weather_cnn.pt"
+    conditions: ["clear", "rain", "fog", "snow"]
+
+# Risk Scoring Weights
+risk_weights:
+  drowsiness: 0.25
+  distraction: 0.20
+  unauthorized_objects: 0.15
+  head_pose: 0.15
+  bio_auth: 0.10
+  speed_violation: 0.10
+  alcohol: 0.05
+
+# Thresholds
+thresholds:
+  drowsiness:
+    eye_closure_time: 2.0  # seconds
+    yawn_frequency: 3      # per minute
+    microsleep_duration: 0.5
+    
+  distraction:
+    gaze_away_time: 3.0
+    gesture_timeout: 5.0
+    phone_detection_time: 2.0
+    
+  speed:
+    overspeed_threshold: 10  # km/h over limit
+    harsh_brake_threshold: -8  # m/s²
+    harsh_accel_threshold: 4   # m/s²
+    
+  alcohol:
+    bac_threshold: 0.02
+    face_redness_threshold: 0.7
+    gaze_stability_threshold: 0.6
+
+# Alert Configuration  
+alerts:
+  audio_enabled: true
+  visual_enabled: true
+  haptic_enabled: true
+  severity_levels: ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+  cooldown_period: 5  # seconds between same alerts
+
+# Database Configuration
+database:
+  enabled: true
+  type: "sqlite"
+  path: "neurodrive_data.db"
+  backup_interval: 3600  # seconds
+  
+# API Configuration
+api:
+  enabled: true
+  port: 8080
+  host: "localhost"
+  cors_enabled: true
+  
+# Hardware Integration
+hardware:
+  obd_port: "/dev/ttyUSB0"
+  gps_enabled: true
+  breathalyzer_port: "/dev/ttyACM0"
+  ir_sensor_enabled: true
+  
+# Performance Optimization
+performance:
+  gpu_acceleration: true
+  batch_processing: true
+  frame_skip: 2
+  cpu_cores: 4

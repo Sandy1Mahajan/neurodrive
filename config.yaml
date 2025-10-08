@@ -1,0 +1,14 @@
+risk_weights:
+  drowsiness: 0.25
+  distraction: 0.30
+  headPose: 0.25
+  unauthorizedObjects: 0.20
+
+thresholds:
+  eyeClosureTimeSeconds: 2.0
+  distractionDetectedThreshold: 0.5
+  headPoseDegreesThreshold: 15
+  unauthorizedObjectsThreshold: 1
+  speedLimitKmh: 80
+
+
