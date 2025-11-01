@@ -1,455 +1,321 @@
 """
-AI model module for NeuroDrive DMS with real inference capabilities.
+Production-ready ML model for NeuroDrive DMS inference.
 
-This module provides production-ready AI models for:
-- Eye aspect ratio / eye closure detection (PERCLOS)
-- Head pose estimation
-- Emotion recognition (stress, anger, happiness)
-- Distraction classification (phone usage, gaze direction)
-- Object detection for cabin anomalies
+Supports two modes:
+1. Deterministic baseline (default): Rule-based calculations with temporal smoothing
+2. ML model: PyTorch/ONNX model for advanced inference
 
-Models are loaded lazily and can be swapped between local and cloud inference.
+The model accepts metrics from the FastAPI endpoint and returns risk scores.
 """
 
 from __future__ import annotations
 
-import numpy as np
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+import os
+import json
 import logging
-from enum import Enum
+import time
+from typing import Any, Dict, Optional
+from dataclasses import dataclass, asdict
+from collections import deque
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
-
-class EmotionType(Enum):
-    HAPPY = "happy"
-    ANGRY = "angry"
-    SAD = "sad"
-    SURPRISED = "surprised"
-    FEAR = "fear"
-    DISGUST = "disgust"
-    NEUTRAL = "neutral"
-    STRESS = "stress"
-
-
-class DistractionType(Enum):
-    PHONE_USAGE = "phone_usage"
-    GAZE_AWAY = "gaze_away"
-    EATING = "eating"
-    DRINKING = "drinking"
-    SMOKING = "smoking"
-    NONE = "none"
+# Try to import optional dependencies
+try:
+    import onnxruntime as ort
+    ONNXRUNTIME_AVAILABLE = True
+except ImportError:
+    ONNXRUNTIME_AVAILABLE = False
+    logger.warning("onnxruntime not available; ONNX inference disabled")
 
 
 @dataclass
-class EyeMetrics:
-    """Eye aspect ratio and closure metrics."""
-    ear: float  # Eye Aspect Ratio
-    left_eye_closed: bool
-    right_eye_closed: bool
-    both_eyes_closed: bool
-    closure_duration: float  # seconds
+class ModelConfig:
+    """Configuration for model inference."""
+    model_type: str = "deterministic"  # "deterministic" or "onnx"
+    model_path: Optional[str] = None
+    smoothing_window: int = 10
+    ear_threshold: float = 0.25
 
 
-@dataclass
-class HeadPose:
-    """Head pose angles in degrees."""
-    pitch: float  # up/down
-    yaw: float    # left/right
-    roll: float   # tilt
-
-
-@dataclass
-class EmotionResult:
-    """Emotion detection result."""
-    emotion: EmotionType
-    confidence: float
-    stress_level: float  # 0.0 to 1.0
-
-
-@dataclass
-class DistractionResult:
-    """Distraction detection result."""
-    distraction_type: DistractionType
-    confidence: float
-    is_distracted: bool
-
-
-@dataclass
-class InferenceInput:
-    """Input data for model inference."""
-    frame: Optional[np.ndarray] = None  # RGB image
-    audio: Optional[np.ndarray] = None  # Audio samples
-    eye_landmarks: Optional[List[Tuple[int, int]]] = None
-    face_landmarks: Optional[List[Tuple[int, int]]] = None
-
-
-@dataclass
-class InferenceResult:
-    """Complete inference result."""
-    eye_metrics: EyeMetrics
-    head_pose: HeadPose
-    emotion: EmotionResult
-    distraction: DistractionResult
-    risk_score: float  # 0.0 to 1.0
-    processing_time: float  # seconds
-
-
-class EyeAspectRatioModel:
-    """Eye closure detection using Eye Aspect Ratio (EAR)."""
+class DeterministicBaseline:
+    """Lightweight deterministic baseline model using rule-based calculations."""
     
-    def __init__(self, ear_threshold: float = 0.25):
-        self.ear_threshold = ear_threshold
-        self.closure_start_time = None
-        self.current_closure_duration = 0.0
+    def __init__(self, config: ModelConfig):
+        self.config = config
+        self.risk_history = deque(maxlen=config.smoothing_window)
+        self.initialized = True
+        logger.info("Deterministic baseline model initialized")
     
-    def calculate_ear(self, eye_landmarks: List[Tuple[int, int]]) -> float:
-        """Calculate Eye Aspect Ratio from eye landmarks."""
-        if len(eye_landmarks) != 6:
-            return 0.0
-        
-        # EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
-        p1, p2, p3, p4, p5, p6 = eye_landmarks
-        
-        vertical_1 = np.linalg.norm(np.array(p2) - np.array(p6))
-        vertical_2 = np.linalg.norm(np.array(p3) - np.array(p5))
-        horizontal = np.linalg.norm(np.array(p1) - np.array(p4))
-        
-        if horizontal == 0:
-            return 0.0
-        
-        ear = (vertical_1 + vertical_2) / (2.0 * horizontal)
-        return ear
+    def is_ready(self) -> bool:
+        """Check if model is ready."""
+        return self.initialized
     
-    def process_eyes(self, left_eye_landmarks: List[Tuple[int, int]], 
-                    right_eye_landmarks: List[Tuple[int, int]], 
-                    timestamp: float) -> EyeMetrics:
-        """Process eye landmarks to detect closure."""
-        left_ear = self.calculate_ear(left_eye_landmarks) if left_eye_landmarks else 0.0
-        right_ear = self.calculate_ear(right_eye_landmarks) if right_eye_landmarks else 0.0
+    def predict(self, 
+                eye_closure_ratio: float,
+                phone_usage: bool,
+                speed: int,
+                head_pose_degrees: Optional[float] = None,
+                unauthorized_objects_count: Optional[int] = None,
+                risk_weights: Optional[Dict[str, float]] = None,
+                thresholds: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Predict risk score from input metrics.
         
-        left_closed = left_ear < self.ear_threshold
-        right_closed = right_ear < self.ear_threshold
-        both_closed = left_closed and right_closed
+        Returns:
+            Dict with riskScore, drowsinessScore, distractionScore, headPoseScore,
+            unauthorizedObjectScore, and explanations
+        """
+        if not self.is_ready():
+            raise RuntimeError("Model not ready")
         
-        # Track closure duration
-        if both_closed:
-            if self.closure_start_time is None:
-                self.closure_start_time = timestamp
-            self.current_closure_duration = timestamp - self.closure_start_time
-        else:
-            self.closure_start_time = None
-            self.current_closure_duration = 0.0
-        
-        return EyeMetrics(
-            ear=(left_ear + right_ear) / 2.0,
-            left_eye_closed=left_closed,
-            right_eye_closed=right_closed,
-            both_eyes_closed=both_closed,
-            closure_duration=self.current_closure_duration
-        )
-
-
-class EmotionModel:
-    """Emotion recognition using facial landmarks and expressions."""
-    
-    def __init__(self):
-        self.emotion_weights = {
-            EmotionType.STRESS: 0.8,
-            EmotionType.ANGRY: 0.7,
-            EmotionType.FEAR: 0.6,
-            EmotionType.SAD: 0.5,
-            EmotionType.NEUTRAL: 0.3,
-            EmotionType.HAPPY: 0.1
+        # Default weights and thresholds
+        weights = risk_weights or {
+            "drowsiness": 0.25,
+            "distraction": 0.30,
+            "headPose": 0.25,
+            "unauthorizedObjects": 0.20
         }
-    
-    def detect_emotion(self, face_landmarks: List[Tuple[int, int]], 
-                      frame: Optional[np.ndarray] = None) -> EmotionResult:
-        """Detect emotion from facial landmarks."""
-        # Simplified emotion detection based on landmark distances
-        if not face_landmarks or len(face_landmarks) < 68:
-            return EmotionResult(EmotionType.NEUTRAL, 0.5, 0.3)
+        thresh = thresholds or {
+            "eyeClosureTimeSeconds": 2.0,
+            "distractionDetectedThreshold": 0.5,
+            "headPoseDegreesThreshold": 15.0,
+            "unauthorizedObjectsThreshold": 1,
+            "speedLimitKmh": 80
+        }
         
-        # Extract key facial features
-        mouth_landmarks = face_landmarks[48:68]
-        eyebrow_landmarks = face_landmarks[17:27]
-        eye_landmarks = face_landmarks[36:48]
+        # Calculate individual scores (0-1 scale)
+        eye_closure_time = eye_closure_ratio * 3.0
         
-        # Calculate stress indicators
-        mouth_tension = self._calculate_mouth_tension(mouth_landmarks)
-        eyebrow_tension = self._calculate_eyebrow_tension(eyebrow_landmarks)
-        eye_tension = self._calculate_eye_tension(eye_landmarks)
-        
-        stress_level = (mouth_tension + eyebrow_tension + eye_tension) / 3.0
-        
-        # Determine primary emotion
-        if stress_level > 0.7:
-            emotion = EmotionType.STRESS
-            confidence = stress_level
-        elif stress_level > 0.5:
-            emotion = EmotionType.ANGRY
-            confidence = stress_level * 0.8
-        elif stress_level < 0.2:
-            emotion = EmotionType.HAPPY
-            confidence = 1.0 - stress_level
+        # Drowsiness score (lower is worse)
+        if eye_closure_time < thresh["eyeClosureTimeSeconds"]:
+            drowsiness_score = 1.0
         else:
-            emotion = EmotionType.NEUTRAL
-            confidence = 0.6
+            excess = eye_closure_time - thresh["eyeClosureTimeSeconds"]
+            drowsiness_score = max(0.0, 1.0 - (excess / 3.0))
         
-        return EmotionResult(emotion, confidence, stress_level)
-    
-    def _calculate_mouth_tension(self, mouth_landmarks: List[Tuple[int, int]]) -> float:
-        """Calculate mouth tension as stress indicator."""
-        if len(mouth_landmarks) < 20:
-            return 0.0
+        # Distraction score
+        distraction_score = 0.0 if phone_usage else 1.0
         
-        # Measure mouth width and height ratios
-        left_corner = mouth_landmarks[0]
-        right_corner = mouth_landmarks[6]
-        top_lip = mouth_landmarks[3]
-        bottom_lip = mouth_landmarks[9]
+        # Head pose score
+        head_pose_val = abs(head_pose_degrees) if head_pose_degrees is not None else 0.0
+        if head_pose_val <= thresh["headPoseDegreesThreshold"]:
+            head_pose_score = 1.0
+        else:
+            excess = head_pose_val - thresh["headPoseDegreesThreshold"]
+            head_pose_score = max(0.0, 1.0 - (excess / 45.0))
         
-        width = np.linalg.norm(np.array(left_corner) - np.array(right_corner))
-        height = np.linalg.norm(np.array(top_lip) - np.array(bottom_lip))
+        # Unauthorized objects score
+        objects_count = unauthorized_objects_count or 0
+        if objects_count <= thresh["unauthorizedObjectsThreshold"]:
+            unauthorized_object_score = 1.0
+        else:
+            unauthorized_object_score = max(0.0, 1.0 - (objects_count - thresh["unauthorizedObjectsThreshold"]) / 3.0)
         
-        if width == 0:
-            return 0.0
+        # Speed factor
+        speed_limit = thresh.get("speedLimitKmh", 80)
+        if speed <= speed_limit:
+            speed_factor = 1.0
+        else:
+            excess_speed = speed - speed_limit
+            speed_factor = max(0.5, 1.0 - (excess_speed / 50.0))
         
-        # Tighter mouth indicates higher stress
-        aspect_ratio = height / width
-        return min(1.0, aspect_ratio * 2.0)
-    
-    def _calculate_eyebrow_tension(self, eyebrow_landmarks: List[Tuple[int, int]]) -> float:
-        """Calculate eyebrow tension."""
-        if len(eyebrow_landmarks) < 10:
-            return 0.0
+        # Weighted risk score
+        total_weight = sum(weights.values())
+        base_risk = (
+            drowsiness_score * weights["drowsiness"] +
+            distraction_score * weights["distraction"] +
+            head_pose_score * weights["headPose"] +
+            unauthorized_object_score * weights["unauthorizedObjects"]
+        ) / total_weight
         
-        # Measure eyebrow height variation
-        heights = [point[1] for point in eyebrow_landmarks]
-        height_variance = np.var(heights)
+        # Apply speed factor
+        risk_score = base_risk * speed_factor
         
-        # Higher variance indicates more tension
-        return min(1.0, height_variance / 100.0)
-    
-    def _calculate_eye_tension(self, eye_landmarks: List[Tuple[int, int]]) -> float:
-        """Calculate eye tension."""
-        if len(eye_landmarks) < 12:
-            return 0.0
+        # Temporal smoothing
+        self.risk_history.append(risk_score)
+        smoothed_risk = float(np.mean(self.risk_history)) if len(self.risk_history) > 0 else risk_score
         
-        # Measure eye opening
-        top_eyelid = min(point[1] for point in eye_landmarks[1:4])
-        bottom_eyelid = max(point[1] for point in eye_landmarks[5:8])
+        # Convert to 0-100 scale for API compatibility
+        risk_score_100 = (1.0 - smoothed_risk) * 100.0
         
-        eye_opening = bottom_eyelid - top_eyelid
-        
-        # Smaller opening indicates stress/squinting
-        return min(1.0, max(0.0, 1.0 - eye_opening / 20.0))
+        return {
+            "riskScore": max(0, min(100, int(round(risk_score_100)))),
+            "drowsinessScore": float(drowsiness_score),
+            "distractionScore": float(distraction_score),
+            "headPoseScore": float(head_pose_score),
+            "unauthorizedObjectScore": float(unauthorized_object_score),
+            "explanations": {
+                "drowsiness": f"Eye closure time: {eye_closure_time:.2f}s (threshold: {thresh['eyeClosureTimeSeconds']}s)",
+                "distraction": f"Phone usage detected: {phone_usage}",
+                "headPose": f"Head pose deviation: {head_pose_val:.1f}° (threshold: {thresh['headPoseDegreesThreshold']}°)",
+                "unauthorizedObjects": f"Unauthorized objects count: {objects_count} (threshold: {thresh['unauthorizedObjectsThreshold']})",
+                "speed": f"Speed: {speed} km/h (limit: {speed_limit} km/h)"
+            }
+        }
 
 
-class DistractionModel:
-    """Distraction detection from visual and audio cues."""
+class ONNXModel:
+    """ONNX model for ML-based inference."""
     
-    def __init__(self):
-        self.phone_detection_threshold = 0.6
-        self.gaze_threshold = 30.0  # degrees
-    
-    def detect_distraction(self, head_pose: HeadPose, 
-                          frame: Optional[np.ndarray] = None,
-                          audio: Optional[np.ndarray] = None) -> DistractionResult:
-        """Detect various types of distractions."""
+    def __init__(self, config: ModelConfig):
+        self.config = config
+        self.session = None
+        self.initialized = False
         
-        # Gaze direction analysis
-        gaze_away = abs(head_pose.yaw) > self.gaze_threshold
+        if not ONNXRUNTIME_AVAILABLE:
+            raise ImportError("onnxruntime is required for ONNX inference")
         
-        # Phone usage detection (simplified)
-        phone_detected = self._detect_phone_usage(frame) if frame is not None else False
-        
-        # Audio-based distraction detection
-        audio_distraction = self._detect_audio_distraction(audio) if audio is not None else False
-        
-        # Determine primary distraction type
-        if phone_detected:
-            distraction_type = DistractionType.PHONE_USAGE
-            confidence = 0.8
-        elif gaze_away:
-            distraction_type = DistractionType.GAZE_AWAY
-            confidence = min(1.0, abs(head_pose.yaw) / 90.0)
-        elif audio_distraction:
-            distraction_type = DistractionType.PHONE_USAGE  # Assume phone call
-            confidence = 0.6
+        if config.model_path and os.path.exists(config.model_path):
+            try:
+                self.session = ort.InferenceSession(
+                    config.model_path,
+                    providers=['CPUExecutionProvider']
+                )
+                self.initialized = True
+                logger.info(f"ONNX model loaded from {config.model_path}")
+            except Exception as e:
+                logger.error(f"Failed to load ONNX model: {e}")
+                raise
         else:
-            distraction_type = DistractionType.NONE
-            confidence = 0.9
-        
-        is_distracted = distraction_type != DistractionType.NONE
-        
-        return DistractionResult(distraction_type, confidence, is_distracted)
+            logger.warning(f"ONNX model path not found: {config.model_path}")
     
-    def _detect_phone_usage(self, frame: np.ndarray) -> bool:
-        """Detect phone usage from visual cues."""
-        # Simplified phone detection - in production, use object detection model
-        # This is a placeholder that returns random results
-        return np.random.random() < 0.1  # 10% chance of detecting phone
+    def is_ready(self) -> bool:
+        """Check if model is ready."""
+        return self.initialized and self.session is not None
     
-    def _detect_audio_distraction(self, audio: np.ndarray) -> bool:
-        """Detect distraction from audio patterns."""
-        if audio is None or len(audio) == 0:
-            return False
+    def predict(self,
+                eye_closure_ratio: float,
+                phone_usage: bool,
+                speed: int,
+                head_pose_degrees: Optional[float] = None,
+                unauthorized_objects_count: Optional[int] = None,
+                risk_weights: Optional[Dict[str, float]] = None,
+                thresholds: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Run ONNX inference."""
+        if not self.is_ready():
+            raise RuntimeError("ONNX model not ready")
         
-        # Simple audio analysis - detect speech patterns
-        # In production, use speech recognition or audio classification
-        audio_energy = np.mean(np.abs(audio))
-        return audio_energy > 0.1  # Threshold for speech detection
+        # Prepare input features (normalized)
+        head_pose_val = abs(head_pose_degrees) if head_pose_degrees is not None else 0.0
+        objects_count = float(unauthorized_objects_count or 0)
+        
+        # Normalize inputs
+        features = np.array([[
+            eye_closure_ratio,  # 0-1
+            float(phone_usage),  # 0 or 1
+            speed / 200.0,  # normalized to 0-1 (assuming max 200 km/h)
+            head_pose_val / 90.0,  # normalized to 0-1 (max 90 degrees)
+            objects_count / 5.0  # normalized to 0-1 (max 5 objects)
+        ]], dtype=np.float32)
+        
+        # Get input/output names from model
+        input_name = self.session.get_inputs()[0].name
+        
+        # Run inference
+        start_time = time.time()
+        outputs = self.session.run(None, {input_name: features})
+        inference_time = time.time() - start_time
+        
+        # Extract predictions (assuming model outputs risk scores)
+        # Model should output: [drowsiness_score, distraction_score, head_pose_score, object_score, overall_risk]
+        if len(outputs[0].shape) > 1:
+            predictions = outputs[0][0]
+        else:
+            predictions = outputs[0]
+        
+        # Map outputs (adjust based on your model architecture)
+        if len(predictions) >= 5:
+            drowsiness_score = float(predictions[0])
+            distraction_score = float(predictions[1])
+            head_pose_score = float(predictions[2])
+            unauthorized_object_score = float(predictions[3])
+            base_risk = float(predictions[4])
+        else:
+            # Fallback: use single output as risk score
+            base_risk = float(predictions[0]) if len(predictions) > 0 else 0.5
+            drowsiness_score = distraction_score = head_pose_score = unauthorized_object_score = base_risk
+        
+        # Apply speed factor
+        speed_limit = (thresholds or {}).get("speedLimitKmh", 80)
+        speed_factor = 1.0 if speed <= speed_limit else max(0.5, 1.0 - ((speed - speed_limit) / 50.0))
+        risk_score = base_risk * speed_factor
+        
+        # Convert to 0-100 scale
+        risk_score_100 = (1.0 - risk_score) * 100.0
+        
+        return {
+            "riskScore": max(0, min(100, int(round(risk_score_100)))),
+            "drowsinessScore": float(drowsiness_score),
+            "distractionScore": float(distraction_score),
+            "headPoseScore": float(head_pose_score),
+            "unauthorizedObjectScore": float(unauthorized_object_score),
+            "explanations": {
+                "model": "ONNX ML model",
+                "inference_time_ms": f"{inference_time * 1000:.2f}",
+                "model_path": self.config.model_path
+            }
+        }
 
 
 class Model:
-    """Production-ready AI model for NeuroDrive DMS."""
+    """Production-ready model wrapper supporting both deterministic and ML inference."""
     
     def __init__(self, config: Optional[Dict[str, Any]] = None):
-        self.config = config or {}
-        self.eye_model = EyeAspectRatioModel(
-            ear_threshold=self.config.get('ear_threshold', 0.25)
+        """Initialize model with configuration."""
+        self.config_dict = config or {}
+        
+        # Load model config
+        model_type = self.config_dict.get("model_type", os.getenv("MODEL_TYPE", "deterministic"))
+        model_path = self.config_dict.get("model_path") or os.getenv("MODEL_PATH")
+        
+        model_config = ModelConfig(
+            model_type=model_type,
+            model_path=model_path,
+            smoothing_window=int(self.config_dict.get("smoothing_window", 10))
         )
-        self.emotion_model = EmotionModel()
-        self.distraction_model = DistractionModel()
-        self.initialized = False
-        self._initialize()
-    
-    def _initialize(self) -> None:
-        """Initialize the model components."""
-        try:
-            logger.info("Initializing NeuroDrive AI models...")
-            
-            # Load any additional models here
-            # self.face_detector = load_face_detector()
-            # self.landmark_predictor = load_landmark_predictor()
-            
-            self.initialized = True
-            logger.info("AI models initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize AI models: {e}")
-            self.initialized = False
+        
+        # Initialize appropriate model
+        if model_config.model_type == "onnx":
+            try:
+                self.model = ONNXModel(model_config)
+                logger.info("Using ONNX model for inference")
+            except Exception as e:
+                logger.warning(f"Failed to load ONNX model, falling back to deterministic: {e}")
+                self.model = DeterministicBaseline(model_config)
+        else:
+            self.model = DeterministicBaseline(model_config)
+            logger.info("Using deterministic baseline model for inference")
+        
+        self.initialized = self.model.is_ready()
     
     def is_ready(self) -> bool:
-        """Check if the model is ready for inference."""
-        return self.initialized
+        """Check if model is ready for inference."""
+        return self.initialized and self.model.is_ready()
     
-    def predict(self, inputs: InferenceInput) -> InferenceResult:
-        """Perform complete inference on input data."""
-        if not self.initialized:
-            raise RuntimeError("Model not initialized")
+    def predict_from_api_input(self,
+                              eye_closure_ratio: float,
+                              phone_usage: bool,
+                              speed: int,
+                              head_pose_degrees: Optional[float] = None,
+                              unauthorized_objects_count: Optional[int] = None,
+                              risk_weights: Optional[Dict[str, float]] = None,
+                              thresholds: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Predict from API input format.
         
-        import time
-        start_time = time.time()
+        This is the main method called by the FastAPI endpoint.
+        """
+        if not self.is_ready():
+            raise RuntimeError("Model not ready for inference")
         
-        try:
-            # Extract facial landmarks (simplified - in production use dlib/MediaPipe)
-            left_eye_landmarks = self._extract_left_eye_landmarks(inputs.face_landmarks)
-            right_eye_landmarks = self._extract_right_eye_landmarks(inputs.face_landmarks)
-            
-            # Process eye metrics
-            eye_metrics = self.eye_model.process_eyes(
-                left_eye_landmarks, right_eye_landmarks, time.time()
-            )
-            
-            # Estimate head pose (simplified)
-            head_pose = self._estimate_head_pose(inputs.face_landmarks)
-            
-            # Detect emotion
-            emotion = self.emotion_model.detect_emotion(
-                inputs.face_landmarks, inputs.frame
-            )
-            
-            # Detect distraction
-            distraction = self.distraction_model.detect_distraction(
-                head_pose, inputs.frame, inputs.audio
-            )
-            
-            # Calculate overall risk score
-            risk_score = self._calculate_risk_score(
-                eye_metrics, head_pose, emotion, distraction
-            )
-            
-            processing_time = time.time() - start_time
-            
-            return InferenceResult(
-                eye_metrics=eye_metrics,
-                head_pose=head_pose,
-                emotion=emotion,
-                distraction=distraction,
-                risk_score=risk_score,
-                processing_time=processing_time
-            )
-            
-        except Exception as e:
-            logger.error(f"Inference failed: {e}")
-            raise
-    
-    def _extract_left_eye_landmarks(self, face_landmarks: Optional[List[Tuple[int, int]]]) -> List[Tuple[int, int]]:
-        """Extract left eye landmarks from face landmarks."""
-        if not face_landmarks or len(face_landmarks) < 68:
-            return []
-        return face_landmarks[36:42]  # Left eye landmarks
-    
-    def _extract_right_eye_landmarks(self, face_landmarks: Optional[List[Tuple[int, int]]]) -> List[Tuple[int, int]]:
-        """Extract right eye landmarks from face landmarks."""
-        if not face_landmarks or len(face_landmarks) < 68:
-            return []
-        return face_landmarks[42:48]  # Right eye landmarks
-    
-    def _estimate_head_pose(self, face_landmarks: Optional[List[Tuple[int, int]]]) -> HeadPose:
-        """Estimate head pose from facial landmarks."""
-        if not face_landmarks or len(face_landmarks) < 68:
-            return HeadPose(0.0, 0.0, 0.0)
-        
-        # Simplified head pose estimation
-        # In production, use solvePnP with 3D model points
-        
-        # Use nose tip and eye positions for basic pose estimation
-        nose_tip = face_landmarks[30]
-        left_eye = face_landmarks[36]
-        right_eye = face_landmarks[45]
-        
-        # Calculate basic angles (simplified)
-        eye_vector = np.array(right_eye) - np.array(left_eye)
-        eye_angle = np.arctan2(eye_vector[1], eye_vector[0])
-        
-        # Add some realistic variation
-        pitch = np.random.normal(0, 5)  # degrees
-        yaw = np.random.normal(0, 3)    # degrees
-        roll = np.degrees(eye_angle) + np.random.normal(0, 2)  # degrees
-        
-        return HeadPose(
-            pitch=max(-30, min(30, pitch)),
-            yaw=max(-60, min(60, yaw)),
-            roll=max(-30, min(30, roll))
+        return self.model.predict(
+            eye_closure_ratio=eye_closure_ratio,
+            phone_usage=phone_usage,
+            speed=speed,
+            head_pose_degrees=head_pose_degrees,
+            unauthorized_objects_count=unauthorized_objects_count,
+            risk_weights=risk_weights,
+            thresholds=thresholds
         )
-    
-    def _calculate_risk_score(self, eye_metrics: EyeMetrics, head_pose: HeadPose,
-                             emotion: EmotionResult, distraction: DistractionResult) -> float:
-        """Calculate overall risk score from all metrics."""
-        
-        # Eye closure risk (higher closure duration = higher risk)
-        eye_risk = min(1.0, eye_metrics.closure_duration / 3.0)
-        
-        # Head pose risk (extreme angles = higher risk)
-        head_risk = (abs(head_pose.yaw) / 60.0 + abs(head_pose.pitch) / 30.0) / 2.0
-        head_risk = min(1.0, head_risk)
-        
-        # Emotion risk (stress/anger = higher risk)
-        emotion_risk = emotion.stress_level
-        
-        # Distraction risk
-        distraction_risk = 0.8 if distraction.is_distracted else 0.1
-        
-        # Weighted combination
-        weights = [0.3, 0.2, 0.2, 0.3]  # eye, head, emotion, distraction
-        risks = [eye_risk, head_risk, emotion_risk, distraction_risk]
-        
-        total_risk = sum(w * r for w, r in zip(weights, risks))
-        
-        return min(1.0, max(0.0, total_risk))
-
-

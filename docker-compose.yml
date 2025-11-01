@@ -1,30 +1,156 @@
 version: '3.9'
+
 services:
+  # PostgreSQL database
   postgres:
     image: postgres:16
+    container_name: neurodrive-postgres
     environment:
-      POSTGRES_USER: neurodrive
-      POSTGRES_PASSWORD: neurodrive
-      POSTGRES_DB: neurodrive
+      POSTGRES_USER: ${POSTGRES_USER:-neurodrive}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-neurodrive}
+      POSTGRES_DB: ${POSTGRES_DB:-neurodrive}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-neurodrive}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - neurodrive-network
 
+  # MongoDB database
   mongo:
     image: mongo:7
+    container_name: neurodrive-mongo
     ports:
-      - "27017:27017"
+      - "${MONGO_PORT:-27017}:27017"
     volumes:
       - mongodata:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - neurodrive-network
 
+  # Redis cache
   redis:
-    image: redis:7
+    image: redis:7-alpine
+    container_name: neurodrive-redis
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - neurodrive-network
+
+  # FastAPI backend
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: neurodrive-backend
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    environment:
+      - NEURODRIVE_CONFIG=/app/config.yaml
+      - MODEL_TYPE=${MODEL_TYPE:-deterministic}
+      - MODEL_PATH=${MODEL_PATH:-}
+      - DEV_MODE=${DEV_MODE:-false}
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - MONGO_HOST=mongo
+      - MONGO_PORT=27017
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./backend/models:/app/backend/models:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - neurodrive-network
+    restart: unless-stopped
+
+  # Spring Boot service
+  springboot:
+    build:
+      context: ./springboot
+      dockerfile: Dockerfile
+    container_name: neurodrive-springboot
+    ports:
+      - "${SPRINGBOOT_PORT:-8080}:8080"
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/${POSTGRES_DB:-neurodrive}
+      - SPRING_DATASOURCE_USERNAME=${POSTGRES_USER:-neurodrive}
+      - SPRING_DATASOURCE_PASSWORD=${POSTGRES_PASSWORD:-neurodrive}
+      - SPRING_DATA_MONGODB_HOST=mongo
+      - SPRING_DATA_MONGODB_PORT=27017
+      - SPRING_DATA_MONGODB_DATABASE=${POSTGRES_DB:-neurodrive}
+      - JWT_SECRET=${JWT_SECRET:-mySecretKey123456789012345678901234567890}
+      - JWT_EXPIRATION=${JWT_EXPIRATION:-86400000}
+      - FASTAPI_URL=http://backend:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - neurodrive-network
+    restart: unless-stopped
+
+  # Frontend (React)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: neurodrive-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_SPRINGBOOT_URL=http://localhost:8080
+      - REACT_APP_WS_URL=ws://localhost:8080/ws
+    depends_on:
+      - backend
+      - springboot
+    networks:
+      - neurodrive-network
+    restart: unless-stopped
 
 volumes:
   pgdata:
   mongodata:
+  redisdata:
 
-
+networks:
+  neurodrive-network:
+    driver: bridge
